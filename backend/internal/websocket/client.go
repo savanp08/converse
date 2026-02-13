@@ -28,7 +28,7 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	Hub      *Hub
 	Conn     *websocket.Conn
-	Send     chan models.Message
+	Send     chan interface{}
 	RoomID   string
 	UserID   string
 	Username string
@@ -47,15 +47,22 @@ func (c *Client) LoadHistory(ctx context.Context, service *MessageService) {
 	}
 	log.Printf("[ws] history loaded room=%s count=%d", c.RoomID, len(history))
 
-	for _, msg := range history {
-		select {
-		case c.Send <- msg:
-		case <-ctx.Done():
-			log.Printf("[ws] history send canceled room=%s err=%v", c.RoomID, ctx.Err())
-			return
-		default:
-			log.Printf("[ws] history drop room=%s msg_id=%s reason=send_buffer_full", c.RoomID, msg.ID)
-		}
+	if len(history) == 0 {
+		return
+	}
+
+	packet := map[string]interface{}{
+		"type":    "history",
+		"payload": history,
+	}
+
+	select {
+	case c.Send <- packet:
+		log.Printf("[ws] history sent room=%s count=%d", c.RoomID, len(history))
+	case <-ctx.Done():
+		log.Printf("[ws] history send canceled room=%s err=%v", c.RoomID, ctx.Err())
+	default:
+		log.Printf("[ws] history drop room=%s reason=send_buffer_full", c.RoomID)
 	}
 }
 
@@ -81,7 +88,7 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		Hub:      hub,
 		Conn:     conn,
-		Send:     make(chan models.Message, 256),
+		Send:     make(chan interface{}, 256),
 		RoomID:   roomID,
 		UserID:   userID,
 		Username: username,
@@ -117,6 +124,9 @@ func (c *Client) readPump() {
 		msg.SenderID = c.UserID
 		msg.SenderName = c.Username
 		msg.RoomID = c.RoomID
+		if msg.ID == "" {
+			msg.ID = c.RoomID + "-" + msg.CreatedAt.Format(time.RFC3339Nano)
+		}
 		log.Printf("[ws] recv room=%s msg_id=%s sender=%s type=%s chars=%d",
 			c.RoomID, msg.ID, msg.SenderID, msg.Type, len(msg.Content))
 		c.Hub.broadcast <- msg
@@ -132,7 +142,7 @@ func (c *Client) writePump() {
 
 	for {
 		select {
-		case message, ok := <-c.Send:
+		case payload, ok := <-c.Send:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -140,11 +150,21 @@ func (c *Client) writePump() {
 				return
 			}
 
-			if err := c.Conn.WriteJSON(message); err != nil {
-				log.Printf("[ws] write json failed room=%s msg_id=%s err=%v", c.RoomID, message.ID, err)
+			if err := c.Conn.WriteJSON(payload); err != nil {
+				log.Printf("[ws] write json failed room=%s err=%v", c.RoomID, err)
 				return
 			}
-			log.Printf("[ws] sent room=%s msg_id=%s sender=%s type=%s", c.RoomID, message.ID, message.SenderID, message.Type)
+
+			switch message := payload.(type) {
+			case models.Message:
+				log.Printf("[ws] sent room=%s msg_id=%s sender=%s type=%s", c.RoomID, message.ID, message.SenderID, message.Type)
+			case map[string]interface{}:
+				if packetType, ok := message["type"].(string); ok && packetType == "history" {
+					log.Printf("[ws] sent history envelope room=%s", c.RoomID)
+				}
+			default:
+				log.Printf("[ws] sent payload room=%s", c.RoomID)
+			}
 
 		case <-ticker.C:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))

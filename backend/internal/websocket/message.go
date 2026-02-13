@@ -124,7 +124,17 @@ func (s *MessageService) GetRecentMessages(ctx context.Context, roomID string) (
 		return redisMessages, nil
 	}
 
-	scyllaMessagesDesc, err := s.queryScyllaMessages(roomID, needed)
+	var before *time.Time
+	if len(redisMessages) > 0 && !redisMessages[0].CreatedAt.IsZero() {
+		oldestCached := redisMessages[0].CreatedAt
+		before = &oldestCached
+	}
+
+	scyllaMessagesDesc, err := s.queryScyllaMessages(roomID, needed, before)
+	if err != nil && before != nil {
+		log.Printf("[message-service] scoped scylla query failed room=%s err=%v", roomID, err)
+		scyllaMessagesDesc, err = s.queryScyllaMessages(roomID, needed, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +160,36 @@ func decodeCachedMessages(rawMessages []string) []models.Message {
 		if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 			continue
 		}
+
+		if msg.Content == "" || msg.SenderID == "" || msg.SenderName == "" || msg.CreatedAt.IsZero() {
+			var legacy map[string]interface{}
+			if err := json.Unmarshal([]byte(raw), &legacy); err == nil {
+				if msg.Content == "" {
+					msg.Content = toString(legacy["content"])
+					if msg.Content == "" {
+						msg.Content = toString(legacy["text"])
+					}
+				}
+				if msg.SenderID == "" {
+					msg.SenderID = toString(legacy["senderId"])
+					if msg.SenderID == "" {
+						msg.SenderID = toString(legacy["userId"])
+					}
+				}
+				if msg.SenderName == "" {
+					msg.SenderName = toString(legacy["senderName"])
+					if msg.SenderName == "" {
+						msg.SenderName = toString(legacy["username"])
+					}
+				}
+				if msg.CreatedAt.IsZero() {
+					msg.CreatedAt = toTime(legacy["createdAt"])
+					if msg.CreatedAt.IsZero() {
+						msg.CreatedAt = toTime(legacy["time"])
+					}
+				}
+			}
+		}
 		messages = append(messages, msg)
 	}
 	return messages
@@ -161,7 +201,7 @@ func dedupeChronological(messages []models.Message) []models.Message {
 	for _, msg := range messages {
 		key := msg.ID
 		if key == "" {
-			key = fmt.Sprintf("%s|%s|%d|%s", msg.RoomID, msg.SenderID, msg.CreatedAt.UnixNano(), msg.Content)
+			key = fmt.Sprintf("%s|%s|%s", msg.RoomID, msg.SenderID, msg.Content)
 		}
 		if _, exists := seen[key]; exists {
 			continue
@@ -172,16 +212,19 @@ func dedupeChronological(messages []models.Message) []models.Message {
 	return result
 }
 
-func (s *MessageService) queryScyllaMessages(roomID string, limit int) ([]models.Message, error) {
+func (s *MessageService) queryScyllaMessages(roomID string, limit int, before *time.Time) ([]models.Message, error) {
 	if limit <= 0 {
 		return []models.Message{}, nil
 	}
 
-	iter := s.Scylla.Session.Query(
-		`SELECT room_id, message_id, sender_id, sender_name, content, type, created_at FROM messages WHERE room_id = ? ORDER BY created_at DESC LIMIT ?`,
-		roomID,
-		limit,
-	).Iter()
+	query := `SELECT room_id, message_id, sender_id, sender_name, content, type, created_at FROM messages WHERE room_id = ? ORDER BY created_at DESC LIMIT ?`
+	args := []interface{}{roomID, limit}
+	if before != nil {
+		query = `SELECT room_id, message_id, sender_id, sender_name, content, type, created_at FROM messages WHERE room_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`
+		args = []interface{}{roomID, *before, limit}
+	}
+
+	iter := s.Scylla.Session.Query(query, args...).Iter()
 
 	messages := make([]models.Message, 0, limit)
 	var dbRoomID string
@@ -208,4 +251,38 @@ func (s *MessageService) queryScyllaMessages(roomID string, limit int) ([]models
 	}
 
 	return messages, nil
+}
+
+func toString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	case int:
+		return fmt.Sprintf("%d", v)
+	default:
+		return ""
+	}
+}
+
+func toTime(value interface{}) time.Time {
+	switch v := value.(type) {
+	case string:
+		if parsed, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return parsed
+		}
+		if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+			return parsed
+		}
+	case float64:
+		return time.Unix(int64(v), 0).UTC()
+	case int64:
+		return time.Unix(v, 0).UTC()
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return time.Unix(n, 0).UTC()
+		}
+	}
+	return time.Time{}
 }

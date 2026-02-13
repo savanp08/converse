@@ -36,7 +36,6 @@
 
 	const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://localhost:8080';
 	const WS_BASE = (import.meta.env.VITE_WS_BASE as string | undefined) ?? 'ws://localhost:8080';
-	const ROOM_EXTEND_INTERVAL_MS = 5 * 60 * 1000;
 
 	let ws: WebSocket | null = null;
 	let wsRoomId = '';
@@ -62,8 +61,7 @@
 	let messagesByRoom: Record<string, ChatMessage[]> = {};
 	let onlineByRoom: Record<string, OnlineMember[]> = {};
 	let pendingOutgoingByRoom: Record<string, ChatMessage[]> = {};
-	let extendTimer: ReturnType<typeof setInterval> | null = null;
-	let extendTimerRoomID = '';
+	let isExtendingRoom = false;
 
 	let fileInput: HTMLInputElement | null = null;
 	let messageViewport: HTMLDivElement | null = null;
@@ -97,9 +95,6 @@
 	$: if (browser && roomId && roomId !== lastToastRoom) {
 		showJoinToast(roomId);
 	}
-	$: if (browser && roomId) {
-		setupRoomExtendTimer(roomId);
-	}
 	$: if (visibleMessages.length !== lastRenderedMessageCount) {
 		lastRenderedMessageCount = visibleMessages.length;
 		void tick().then(scrollMessagesToBottom);
@@ -110,7 +105,6 @@
 		closeSocket();
 		clearReconnectTimer();
 		clearToastTimer();
-		clearRoomExtendTimer();
 	});
 
 	function clientLog(event: string, payload?: unknown) {
@@ -134,14 +128,6 @@
 			clearTimeout(toastTimer);
 			toastTimer = null;
 		}
-	}
-
-	function clearRoomExtendTimer() {
-		if (extendTimer) {
-			clearInterval(extendTimer);
-			extendTimer = null;
-		}
-		extendTimerRoomID = '';
 	}
 
 	function showJoinToast(activeRoomId: string) {
@@ -277,7 +263,6 @@
 				reconnectAttempts = 0;
 				markRoomAsRead(targetRoomId);
 				flushPendingOutgoing(targetRoomId);
-				void extendRoomTTL(targetRoomId);
 			};
 
 			nextSocket.onmessage = (event: MessageEvent) => {
@@ -677,7 +662,6 @@
 		} else {
 			queueOutgoing(nextMessage);
 		}
-		void extendRoomTTL(roomId);
 
 		await tick();
 		scrollMessagesToBottom();
@@ -797,24 +781,17 @@
 		}
 	}
 
-	function setupRoomExtendTimer(targetRoomId: string) {
-		if (!targetRoomId || extendTimerRoomID === targetRoomId) {
-			return;
-		}
-
-		clearRoomExtendTimer();
-		extendTimerRoomID = targetRoomId;
-		void extendRoomTTL(targetRoomId);
-		extendTimer = setInterval(() => {
-			void extendRoomTTL(targetRoomId);
-		}, ROOM_EXTEND_INTERVAL_MS);
-	}
-
 	async function extendRoomTTL(targetRoomId: string) {
 		if (!browser || !targetRoomId) {
 			return;
 		}
 
+		if (isExtendingRoom) {
+			clientLog('api-rooms-extend-skipped', { roomId: targetRoomId, reason: 'in-flight' });
+			return;
+		}
+
+		isExtendingRoom = true;
 		try {
 			clientLog('api-rooms-extend-request', { roomId: targetRoomId });
 			const res = await fetch(`${API_BASE}/api/rooms/extend`, {
@@ -822,25 +799,48 @@
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ roomId: targetRoomId })
 			});
+			const data = await res.json().catch(() => ({}));
 			clientLog('api-rooms-extend-response', {
 				roomId: targetRoomId,
 				status: res.status,
-				ok: res.ok
+				ok: res.ok,
+				data
 			});
 
-			if (!res.ok && res.status === 403) {
-				const data = await res.json().catch(() => ({ error: 'Room has reached its 15-day limit' }));
+			if (!res.ok) {
 				toastMessage = data.error || 'Room has reached its 15-day limit';
 				showToast = true;
 				clearToastTimer();
-				clearRoomExtendTimer();
 				toastTimer = setTimeout(() => {
 					showToast = false;
 				}, 3000);
+				return;
 			}
+
+			toastMessage = data.message || 'Room extended for 24 hours';
+			showToast = true;
+			clearToastTimer();
+			toastTimer = setTimeout(() => {
+				showToast = false;
+			}, 3000);
 		} catch (error) {
 			console.error(`${CLIENT_LOG_PREFIX} failed to extend room TTL`, error);
+			toastMessage = 'Failed to extend room';
+			showToast = true;
+			clearToastTimer();
+			toastTimer = setTimeout(() => {
+				showToast = false;
+			}, 3000);
+		} finally {
+			isExtendingRoom = false;
 		}
+	}
+
+	function requestRoomExtension() {
+		if (!roomId) {
+			return;
+		}
+		void extendRoomTTL(roomId);
 	}
 
 	function toggleRoomMenu() {
@@ -1216,6 +1216,18 @@
 			<button type="button" on:click={closeRoomInfo}>Close</button>
 		</header>
 		<div class="mobile-info-content">
+			<div class="room-actions">
+				<button
+					type="button"
+					class="extend-room-button"
+					on:click={requestRoomExtension}
+					disabled={isExtendingRoom}
+				>
+					{isExtendingRoom ? 'Extending...' : 'Extend Room (24h)'}
+				</button>
+				<p>Manually extends this room for 24 hours (up to 15 days total).</p>
+			</div>
+
 			{#if currentOnlineMembers.length === 0}
 				<div class="empty-label">No online members.</div>
 			{:else}
@@ -1738,6 +1750,37 @@
 	.mobile-info-content {
 		padding: 0.7rem 0.85rem;
 		overflow: auto;
+	}
+
+	.room-actions {
+		margin-bottom: 0.9rem;
+		padding: 0.75rem;
+		border: 1px solid #e2e8f0;
+		border-radius: 10px;
+		background: #f8fafc;
+	}
+
+	.room-actions p {
+		margin: 0.45rem 0 0;
+		font-size: 0.78rem;
+		color: #475569;
+	}
+
+	.extend-room-button {
+		width: 100%;
+		border: 1px solid #15803d;
+		background: #16a34a;
+		color: #ffffff;
+		border-radius: 8px;
+		padding: 0.48rem 0.65rem;
+		font-size: 0.84rem;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.extend-room-button:disabled {
+		opacity: 0.7;
+		cursor: not-allowed;
 	}
 
 	.toast {
