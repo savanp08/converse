@@ -49,6 +49,7 @@ func New(hub *websocket.Hub, redisStore *database.RedisStore) *chi.Mux {
 
 		r.Post("/rooms", roomHandler.CreateRoom)
 		r.Post("/rooms/join", roomHandler.JoinRoom)
+		r.Post("/rooms/extend", roomHandler.ExtendRoom)
 	})
 
 	return r

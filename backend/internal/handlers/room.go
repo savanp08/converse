@@ -4,12 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/savanp08/converse/internal/database"
+)
+
+const (
+	roomKeyTTL       = 24 * time.Hour
+	roomMaxExtendAge = 14 * 24 * time.Hour
 )
 
 var roomSuffixWords = []string{
@@ -40,6 +48,16 @@ type JoinRoomResponse struct {
 	Token    string `json:"token"`
 }
 
+type ExtendRoomRequest struct {
+	RoomID string `json:"roomId"`
+}
+
+type ExtendRoomResponse struct {
+	RoomID           string `json:"roomId"`
+	ExpiresInSeconds int64  `json:"expiresInSeconds"`
+	Message          string `json:"message"`
+}
+
 func (h *RoomHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	var req JoinRoomRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -47,6 +65,7 @@ func (h *RoomHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON format"})
 		return
 	}
+	log.Printf("[room] join requested raw_room=%q username=%q type=%q", req.RoomName, req.Username, req.Type)
 
 	if strings.TrimSpace(req.RoomName) == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -82,11 +101,7 @@ func (h *RoomHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if created {
-		finalRoomID = baseSlug
-		finalRoomName = baseSlug
-	} else {
-		// suffix retry
+	if !created {
 		suffixOrder := rng.Perm(len(roomSuffixWords))
 		for i := 0; i < 3 && i < len(suffixOrder); i++ {
 			candidateID := fmt.Sprintf("%s-%s", baseSlug, roomSuffixWords[suffixOrder[i]])
@@ -105,21 +120,33 @@ func (h *RoomHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	}
 
-		// numeric fallback
-		if !created {
+	if !created {
+		for attempts := 0; attempts < 10; attempts++ {
 			fallbackID := fmt.Sprintf("%s-%d", baseSlug, rng.Intn(9000)+1000)
 			fallbackName := fallbackID
 
-			if err := h.createRoom(ctx, fallbackID, fallbackName, roomType, createdAt); err != nil {
+			created, err = h.tryCreateRoom(ctx, fallbackID, fallbackName, roomType, createdAt)
+			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to create room"})
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to access room storage"})
 				return
 			}
 
-			finalRoomID = fallbackID
-			finalRoomName = fallbackName
+			if created {
+				finalRoomID = fallbackID
+				finalRoomName = fallbackName
+				break
+			}
 		}
+	}
+	log.Printf("[room] join resolved room_id=%s room_name=%s user_id=%s", finalRoomID, finalRoomName, userID)
+
+	if !created {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to allocate unique room name"})
+		return
 	}
 
 	response := JoinRoomResponse{
@@ -127,6 +154,82 @@ func (h *RoomHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		RoomName: finalRoomName,
 		UserID:   userID,
 		Token:    token,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *RoomHandler) ExtendRoom(w http.ResponseWriter, r *http.Request) {
+	var req ExtendRoomRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON format"})
+		return
+	}
+	log.Printf("[room] extend requested room_id=%q", req.RoomID)
+
+	roomID := slugifyRoomName(req.RoomID)
+	if roomID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "roomId is required"})
+		return
+	}
+
+	ctx := context.Background()
+	roomKey := "room:" + roomID
+
+	exists, err := h.redis.Client.Exists(ctx, roomKey).Result()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to access room storage"})
+		return
+	}
+	if exists == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Room not found"})
+		return
+	}
+
+	createdAtRaw, err := h.redis.Client.HGet(ctx, roomKey, "created_at").Result()
+	if err == redis.Nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Room metadata is incomplete"})
+		return
+	}
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read room metadata"})
+		return
+	}
+
+	createdAtUnix, err := strconv.ParseInt(createdAtRaw, 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Room metadata is invalid"})
+		return
+	}
+
+	age := time.Since(time.Unix(createdAtUnix, 0))
+	if age >= roomMaxExtendAge {
+		log.Printf("[room] extend denied room_id=%s age_hours=%.2f", roomID, age.Hours())
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Room has reached its 15-day limit"})
+		return
+	}
+
+	if err := h.redis.Client.Expire(ctx, roomKey, roomKeyTTL).Err(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to extend room"})
+		return
+	}
+	log.Printf("[room] extend success room_id=%s ttl_seconds=%d", roomID, int64(roomKeyTTL.Seconds()))
+
+	response := ExtendRoomResponse{
+		RoomID:           roomID,
+		ExpiresInSeconds: int64(roomKeyTTL.Seconds()),
+		Message:          "Room extended",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -184,12 +287,21 @@ func (h *RoomHandler) roomExists(ctx context.Context, roomID string) (bool, erro
 }
 
 func (h *RoomHandler) createRoom(ctx context.Context, roomID, roomName, roomType string, createdAt int64) error {
-	return h.redis.Client.HSet(ctx, "room:"+roomID, map[string]interface{}{
+	roomKey := "room:" + roomID
+	if err := h.redis.Client.HSet(ctx, roomKey, map[string]interface{}{
 		"id":         roomID,
 		"name":       roomName,
 		"type":       roomType,
 		"created_at": createdAt,
-	}).Err()
+	}).Err(); err != nil {
+		return err
+	}
+
+	if err := h.redis.Client.Expire(ctx, roomKey, roomKeyTTL).Err(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (h *RoomHandler) CreateRoom(w http.ResponseWriter, r *http.Request) {

@@ -32,7 +32,11 @@
 		isOnline: boolean;
 	};
 
+	const CLIENT_LOG_PREFIX = '[chat-client]';
+
+	const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://localhost:8080';
 	const WS_BASE = (import.meta.env.VITE_WS_BASE as string | undefined) ?? 'ws://localhost:8080';
+	const ROOM_EXTEND_INTERVAL_MS = 5 * 60 * 1000;
 
 	let ws: WebSocket | null = null;
 	let wsRoomId = '';
@@ -58,12 +62,15 @@
 	let messagesByRoom: Record<string, ChatMessage[]> = {};
 	let onlineByRoom: Record<string, OnlineMember[]> = {};
 	let pendingOutgoingByRoom: Record<string, ChatMessage[]> = {};
+	let extendTimer: ReturnType<typeof setInterval> | null = null;
+	let extendTimerRoomID = '';
 
 	let fileInput: HTMLInputElement | null = null;
 	let messageViewport: HTMLDivElement | null = null;
 	let lastRenderedMessageCount = 0;
 
 	$: roomId = decodeURIComponent($page.params.roomId ?? '');
+	$: roomNameFromURL = decodeURIComponent($page.url.searchParams.get('name') ?? '').trim();
 	$: currentUserId = $currentUser?.id ?? 'guest';
 	$: currentUsername = $currentUser?.username ?? 'Guest';
 	$: activeThread =
@@ -72,10 +79,16 @@
 	$: currentOnlineMembers = onlineByRoom[roomId] ?? [];
 	$: activeUnreadCount = activeThread?.unread ?? 0;
 	$: connectionLabel = getConnectionLabel(wsState);
-	$: filteredThreads = getFilteredThreads();
-	$: visibleMessages = getVisibleMessages();
+	$: filteredThreads = getFilteredThreads(
+		roomThreads,
+		chatListSearch,
+		messagesByRoom,
+		roomId,
+		activeThread.name
+	);
+	$: visibleMessages = getVisibleMessages(currentMessages, roomMessageSearch);
 	$: if (roomId) {
-		ensureRoomThread(roomId);
+		ensureRoomThread(roomId, roomNameFromURL || undefined);
 		ensureOnlineSeed(roomId);
 	}
 	$: if (browser && roomId && roomId !== wsRoomId) {
@@ -84,16 +97,30 @@
 	$: if (browser && roomId && roomId !== lastToastRoom) {
 		showJoinToast(roomId);
 	}
+	$: if (browser && roomId) {
+		setupRoomExtendTimer(roomId);
+	}
 	$: if (visibleMessages.length !== lastRenderedMessageCount) {
 		lastRenderedMessageCount = visibleMessages.length;
 		void tick().then(scrollMessagesToBottom);
 	}
 
 	onDestroy(() => {
+		clientLog('component-destroy', { roomId, wsRoomId, wsState });
 		closeSocket();
 		clearReconnectTimer();
 		clearToastTimer();
+		clearRoomExtendTimer();
 	});
+
+	function clientLog(event: string, payload?: unknown) {
+		const timestamp = new Date().toISOString();
+		if (payload === undefined) {
+			console.log(`${CLIENT_LOG_PREFIX} ${timestamp} ${event}`);
+			return;
+		}
+		console.log(`${CLIENT_LOG_PREFIX} ${timestamp} ${event}`, payload);
+	}
 
 	function clearReconnectTimer() {
 		if (reconnectTimer) {
@@ -109,7 +136,16 @@
 		}
 	}
 
+	function clearRoomExtendTimer() {
+		if (extendTimer) {
+			clearInterval(extendTimer);
+			extendTimer = null;
+		}
+		extendTimerRoomID = '';
+	}
+
 	function showJoinToast(activeRoomId: string) {
+		clientLog('toast-joined-room', { roomId: activeRoomId });
 		lastToastRoom = activeRoomId;
 		toastMessage = `Joined Room: ${activeRoomId}`;
 		showToast = true;
@@ -192,15 +228,9 @@
 		}
 
 		const me = { id: currentUserId, name: currentUsername, isOnline: true };
-		const fallbackMembers: OnlineMember[] = [
-			me,
-			{ id: `${targetRoomId}-member-1`, name: 'Member One', isOnline: true },
-			{ id: `${targetRoomId}-member-2`, name: 'Member Two', isOnline: true }
-		];
-
 		onlineByRoom = {
 			...onlineByRoom,
-			[targetRoomId]: dedupeMembers(fallbackMembers)
+			[targetRoomId]: dedupeMembers([me])
 		};
 	}
 
@@ -208,12 +238,15 @@
 		if (!targetRoomId || targetRoomId === roomId) {
 			return;
 		}
+		clientLog('select-room', { fromRoom: roomId, toRoom: targetRoomId });
 		showLeftMenu = false;
 		showRoomMenu = false;
 		showRoomSearch = false;
 		roomMessageSearch = '';
 		showRoomInfo = false;
-		void goto(`/chat/${encodeURIComponent(targetRoomId)}`);
+		const selected = roomThreads.find((thread) => thread.id === targetRoomId);
+		const roomNameQuery = selected?.name ? `?name=${encodeURIComponent(selected.name)}` : '';
+		void goto(`/chat/${encodeURIComponent(targetRoomId)}${roomNameQuery}`);
 	}
 
 	function connectToRoom(targetRoomId: string) {
@@ -221,13 +254,18 @@
 			return;
 		}
 
+		clientLog('ws-connect-start', { targetRoomId, wsBase: WS_BASE });
+
 		clearReconnectTimer();
 		closeSocket();
 		wsState = 'connecting';
 		wsRoomId = targetRoomId;
 
 		try {
-			const nextSocket = new WebSocket(`${WS_BASE}/ws/${encodeURIComponent(targetRoomId)}`);
+			const wsURL = new URL(`${WS_BASE}/ws/${encodeURIComponent(targetRoomId)}`);
+			wsURL.searchParams.set('userId', currentUserId);
+			wsURL.searchParams.set('username', currentUsername);
+			const nextSocket = new WebSocket(wsURL.toString());
 			ws = nextSocket;
 
 			nextSocket.onopen = () => {
@@ -235,9 +273,11 @@
 					return;
 				}
 				wsState = 'open';
+				clientLog('ws-open', { targetRoomId });
 				reconnectAttempts = 0;
 				markRoomAsRead(targetRoomId);
 				flushPendingOutgoing(targetRoomId);
+				void extendRoomTTL(targetRoomId);
 			};
 
 			nextSocket.onmessage = (event: MessageEvent) => {
@@ -245,8 +285,10 @@
 					return;
 				}
 				if (typeof event.data !== 'string') {
+					clientLog('ws-message-non-string', { targetRoomId, dataType: typeof event.data });
 					return;
 				}
+				clientLog('ws-message-recv', { targetRoomId, bytes: event.data.length });
 				handleSocketPayload(event.data, targetRoomId);
 			};
 
@@ -255,6 +297,7 @@
 					return;
 				}
 				wsState = 'error';
+				clientLog('ws-error', { targetRoomId });
 			};
 
 			nextSocket.onclose = () => {
@@ -262,12 +305,13 @@
 					return;
 				}
 				wsState = 'closed';
+				clientLog('ws-close', { targetRoomId });
 				if (roomId === targetRoomId) {
 					scheduleReconnect(targetRoomId);
 				}
 			};
 		} catch (error) {
-			console.error('Socket connection failed', error);
+			console.error(`${CLIENT_LOG_PREFIX} socket connection failed`, error);
 			wsState = 'error';
 			scheduleReconnect(targetRoomId);
 		}
@@ -277,6 +321,7 @@
 		clearReconnectTimer();
 		reconnectAttempts = Math.min(reconnectAttempts + 1, 5);
 		const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 9000);
+		clientLog('ws-reconnect-scheduled', { targetRoomId, reconnectAttempts, delayMs: delay });
 		reconnectTimer = setTimeout(() => {
 			if (roomId === targetRoomId) {
 				connectToRoom(targetRoomId);
@@ -292,6 +337,7 @@
 		}
 
 		const activeSocket = ws;
+		clientLog('ws-close-requested', { wsRoomId, readyState: activeSocket.readyState });
 		ws = null;
 		activeSocket.onopen = null;
 		activeSocket.onmessage = null;
@@ -312,7 +358,7 @@
 		try {
 			parsed = JSON.parse(raw);
 		} catch (error) {
-			console.error('Failed to parse socket payload', error);
+			console.error(`${CLIENT_LOG_PREFIX} failed to parse socket payload`, error, raw);
 			return;
 		}
 
@@ -320,6 +366,7 @@
 			const history = parsed
 				.map((entry) => parseIncomingMessage(entry, targetRoomId))
 				.filter((entry): entry is ChatMessage => Boolean(entry));
+			clientLog('ws-history-array', { targetRoomId, count: history.length });
 			mergeMessages(targetRoomId, history);
 			markRoomAsRead(targetRoomId);
 			return;
@@ -332,6 +379,7 @@
 
 		const singleMessage = parseIncomingMessage(parsed, targetRoomId);
 		if (singleMessage) {
+			clientLog('ws-single-message', { targetRoomId, messageId: singleMessage.id });
 			addIncomingMessage(singleMessage);
 		}
 	}
@@ -347,6 +395,7 @@
 
 	function handleEnvelope(envelope: { type: string; payload: unknown }, targetRoomId: string) {
 		const kind = envelope.type;
+		clientLog('ws-envelope', { targetRoomId, kind });
 		if (kind === 'history' || kind === 'recent_messages' || kind === 'initial_messages') {
 			if (Array.isArray(envelope.payload)) {
 				const history = envelope.payload
@@ -405,16 +454,20 @@
 		}
 
 		const messageType = toStringValue(source.type ?? 'text') || 'text';
-		const messageContent = toStringValue(source.content ?? source.text ?? '');
+		const messageContent = toStringValue(source.text ?? source.content ?? '');
 
 		const normalized: ChatMessage = {
 			id: toStringValue(source.id) || createMessageId(nextRoomId),
 			roomId: nextRoomId,
-			senderId: toStringValue(source.senderId ?? source.sender_id ?? 'unknown'),
-			senderName: toStringValue(source.senderName ?? source.sender_name ?? 'Unknown'),
+			senderId: toStringValue(source.userId ?? source.senderId ?? source.sender_id ?? 'unknown'),
+			senderName: toStringValue(
+				source.username ?? source.senderName ?? source.sender_name ?? 'Unknown'
+			),
 			content: messageContent,
 			type: messageType,
-			createdAt: toTimestamp(source.createdAt ?? source.created_at ?? source.timestamp),
+			createdAt: toTimestamp(
+				source.time ?? source.createdAt ?? source.created_at ?? source.timestamp
+			),
 			pending: false
 		};
 
@@ -463,6 +516,12 @@
 		}
 
 		nextMessages.sort((a, b) => a.createdAt - b.createdAt);
+		clientLog('message-upsert', {
+			targetRoomId,
+			messageId: message.id,
+			pending: Boolean(message.pending),
+			total: nextMessages.length
+		});
 		messagesByRoom = {
 			...messagesByRoom,
 			[targetRoomId]: nextMessages
@@ -545,6 +604,7 @@
 
 	function queueOutgoing(message: ChatMessage) {
 		const currentQueue = pendingOutgoingByRoom[message.roomId] ?? [];
+		clientLog('queue-outgoing', { roomId: message.roomId, messageId: message.id });
 		pendingOutgoingByRoom = {
 			...pendingOutgoingByRoom,
 			[message.roomId]: [...currentQueue, message]
@@ -554,10 +614,17 @@
 	function flushPendingOutgoing(targetRoomId: string) {
 		const roomQueue = pendingOutgoingByRoom[targetRoomId] ?? [];
 		if (roomQueue.length === 0 || !ws || ws.readyState !== WebSocket.OPEN) {
+			clientLog('flush-outgoing-skip', {
+				targetRoomId,
+				queueSize: roomQueue.length,
+				wsReadyState: ws?.readyState
+			});
 			return;
 		}
 
+		clientLog('flush-outgoing-start', { targetRoomId, queueSize: roomQueue.length });
 		for (const queued of roomQueue) {
+			clientLog('ws-send-queued', { targetRoomId, messageId: queued.id });
 			ws.send(JSON.stringify(toWireMessage(queued)));
 		}
 		pendingOutgoingByRoom = {
@@ -567,8 +634,14 @@
 	}
 
 	async function sendMessage() {
+		if (!roomId) {
+			clientLog('send-message-skip-no-room');
+			return;
+		}
+
 		const text = draftMessage.trim();
 		if (!text && !attachedFile) {
+			clientLog('send-message-skip-empty');
 			return;
 		}
 
@@ -585,6 +658,12 @@
 
 		upsertMessage(roomId, nextMessage, false);
 		markRoomAsRead(roomId);
+		clientLog('send-message-local', {
+			roomId,
+			messageId: nextMessage.id,
+			type: nextMessage.type,
+			wsReadyState: ws?.readyState
+		});
 
 		draftMessage = '';
 		attachedFile = null;
@@ -593,10 +672,12 @@
 		}
 
 		if (ws && ws.readyState === WebSocket.OPEN) {
+			clientLog('ws-send-live', { roomId, messageId: nextMessage.id });
 			ws.send(JSON.stringify(toWireMessage(nextMessage)));
 		} else {
 			queueOutgoing(nextMessage);
 		}
+		void extendRoomTTL(roomId);
 
 		await tick();
 		scrollMessagesToBottom();
@@ -606,6 +687,10 @@
 		return {
 			id: message.id,
 			roomId: message.roomId,
+			userId: message.senderId,
+			username: message.senderName,
+			text: message.content,
+			time: new Date(message.createdAt).toISOString(),
 			senderId: message.senderId,
 			senderName: message.senderName,
 			content: message.content,
@@ -653,21 +738,109 @@
 		showRoomMenu = false;
 	}
 
-	function createRoomFromMenu() {
+	async function createRoomFromMenu() {
 		const input = window.prompt('Enter a room name');
 		showLeftMenu = false;
 		if (!input) {
 			return;
 		}
 
-		const nextRoomId = toRoomSlug(input);
-		if (!nextRoomId) {
+		const requestedName = input.trim();
+		if (!requestedName) {
 			return;
 		}
 
-		ensureRoomThread(nextRoomId);
-		ensureOnlineSeed(nextRoomId);
-		void goto(`/chat/${encodeURIComponent(nextRoomId)}`);
+		const joinUsername = currentUsername || `Guest_${Math.floor(Math.random() * 10000)}`;
+		if (!$currentUser) {
+			currentUser.set({ id: currentUserId, username: joinUsername });
+		}
+
+		try {
+			clientLog('api-rooms-join-request', { requestedName, joinUsername });
+			const res = await fetch(`${API_BASE}/api/rooms/join`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ roomName: requestedName, username: joinUsername, type: 'ephemeral' })
+			});
+			const data = await res.json();
+			clientLog('api-rooms-join-response', { status: res.status, ok: res.ok, data });
+			if (!res.ok) {
+				throw new Error(data.error || 'Failed to create room');
+			}
+
+			const nextRoomId = toStringValue(data.roomId) || toRoomSlug(requestedName);
+			const nextRoomName = toStringValue(data.roomName) || formatRoomName(nextRoomId);
+			const nextUserId = toStringValue(data.userId);
+			if (!nextRoomId) {
+				throw new Error('Failed to resolve room id');
+			}
+			if (nextUserId) {
+				currentUser.set({ id: nextUserId, username: joinUsername });
+			}
+
+			ensureRoomThread(nextRoomId, nextRoomName);
+			ensureOnlineSeed(nextRoomId);
+			await goto(
+				`/chat/${encodeURIComponent(nextRoomId)}?name=${encodeURIComponent(nextRoomName)}`
+			);
+		} catch (error) {
+			clientLog('api-rooms-join-error', {
+				error: error instanceof Error ? error.message : String(error)
+			});
+			const message = error instanceof Error ? error.message : 'Failed to create room';
+			toastMessage = message;
+			showToast = true;
+			clearToastTimer();
+			toastTimer = setTimeout(() => {
+				showToast = false;
+			}, 3000);
+		}
+	}
+
+	function setupRoomExtendTimer(targetRoomId: string) {
+		if (!targetRoomId || extendTimerRoomID === targetRoomId) {
+			return;
+		}
+
+		clearRoomExtendTimer();
+		extendTimerRoomID = targetRoomId;
+		void extendRoomTTL(targetRoomId);
+		extendTimer = setInterval(() => {
+			void extendRoomTTL(targetRoomId);
+		}, ROOM_EXTEND_INTERVAL_MS);
+	}
+
+	async function extendRoomTTL(targetRoomId: string) {
+		if (!browser || !targetRoomId) {
+			return;
+		}
+
+		try {
+			clientLog('api-rooms-extend-request', { roomId: targetRoomId });
+			const res = await fetch(`${API_BASE}/api/rooms/extend`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ roomId: targetRoomId })
+			});
+			clientLog('api-rooms-extend-response', {
+				roomId: targetRoomId,
+				status: res.status,
+				ok: res.ok
+			});
+
+			if (!res.ok && res.status === 403) {
+				const data = await res.json().catch(() => ({ error: 'Room has reached its 15-day limit' }));
+				toastMessage = data.error || 'Room has reached its 15-day limit';
+				showToast = true;
+				clearToastTimer();
+				clearRoomExtendTimer();
+				toastTimer = setTimeout(() => {
+					showToast = false;
+				}, 3000);
+			}
+		} catch (error) {
+			console.error(`${CLIENT_LOG_PREFIX} failed to extend room TTL`, error);
+		}
 	}
 
 	function toggleRoomMenu() {
@@ -704,9 +877,15 @@
 		showRoomMenu = false;
 	}
 
-	function getFilteredThreads() {
-		const threadsWithActive = getThreadsWithActive();
-		const query = chatListSearch.trim().toLowerCase();
+	function getFilteredThreads(
+		threads: ChatThread[],
+		searchQuery: string,
+		messageMap: Record<string, ChatMessage[]>,
+		activeRoomId: string,
+		activeRoomName: string
+	) {
+		const threadsWithActive = getThreadsWithActive(threads, activeRoomId, activeRoomName);
+		const query = searchQuery.trim().toLowerCase();
 		if (!query) {
 			return threadsWithActive;
 		}
@@ -718,7 +897,7 @@
 			if (thread.lastMessage.toLowerCase().includes(query)) {
 				return true;
 			}
-			const messages = messagesByRoom[thread.id] ?? [];
+			const messages = messageMap[thread.id] ?? [];
 			return messages.some(
 				(message) =>
 					message.content.toLowerCase().includes(query) ||
@@ -726,8 +905,8 @@
 			);
 		});
 
-		if (roomId && !filtered.some((thread) => thread.id === roomId)) {
-			const activeFallback = threadsWithActive.find((thread) => thread.id === roomId);
+		if (activeRoomId && !filtered.some((thread) => thread.id === activeRoomId)) {
+			const activeFallback = threadsWithActive.find((thread) => thread.id === activeRoomId);
 			if (activeFallback) {
 				return [activeFallback, ...filtered];
 			}
@@ -736,23 +915,27 @@
 		return filtered;
 	}
 
-	function getThreadsWithActive() {
-		if (!roomId) {
-			return roomThreads;
+	function getThreadsWithActive(
+		threads: ChatThread[],
+		activeRoomId: string,
+		activeRoomName: string
+	) {
+		if (!activeRoomId) {
+			return threads;
 		}
-		if (roomThreads.some((thread) => thread.id === roomId)) {
-			return roomThreads;
+		if (threads.some((thread) => thread.id === activeRoomId)) {
+			return threads;
 		}
-		return sortThreads([createThread(roomId, activeThread.name), ...roomThreads]);
+		return sortThreads([createThread(activeRoomId, activeRoomName), ...threads]);
 	}
 
-	function getVisibleMessages() {
-		const query = roomMessageSearch.trim().toLowerCase();
+	function getVisibleMessages(messages: ChatMessage[], searchQuery: string) {
+		const query = searchQuery.trim().toLowerCase();
 		if (!query) {
-			return currentMessages;
+			return messages;
 		}
 
-		return currentMessages.filter(
+		return messages.filter(
 			(message) =>
 				message.content.toLowerCase().includes(query) ||
 				message.senderName.toLowerCase().includes(query)

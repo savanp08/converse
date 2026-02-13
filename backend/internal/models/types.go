@@ -10,13 +10,13 @@ type User struct {
 }
 
 type Message struct {
-	ID         string    `json:"id"`
-	RoomID     string    `json:"roomId"`
-	SenderID   string    `json:"senderId"`
-	SenderName string    `json:"senderName"`
-	Content    string    `json:"content"`
-	Type       string    `json:"type"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID         string    `json:"id" cql:"message_id"`
+	RoomID     string    `json:"roomId" cql:"room_id"`
+	SenderID   string    `json:"userId" cql:"sender_id"`
+	SenderName string    `json:"username" cql:"sender_name"`
+	Content    string    `json:"text" cql:"content"`
+	Type       string    `json:"type" cql:"type"`
+	CreatedAt  time.Time `json:"time" cql:"created_at"`
 }
 
 type Room struct {
