@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:latest
+    container_name: converse-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  cassandra:
+    image: cassandra:latest
+    container_name: converse-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=ConverseCluster
+      - CASSANDRA_DC=dc1
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
