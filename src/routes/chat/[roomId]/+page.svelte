@@ -1,22 +1,857 @@
 <script lang="ts">
+	import { browser } from '$app/environment';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { onMount } from 'svelte';
+	import { currentUser } from '$lib/store';
+	import { onDestroy, tick } from 'svelte';
 
-	let showToast = false;
+	type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
+
+	type ChatMessage = {
+		id: string;
+		roomId: string;
+		senderId: string;
+		senderName: string;
+		content: string;
+		type: string;
+		createdAt: number;
+		pending?: boolean;
+	};
+
+	type ChatThread = {
+		id: string;
+		name: string;
+		lastMessage: string;
+		lastActivity: number;
+		unread: number;
+	};
+
+	type OnlineMember = {
+		id: string;
+		name: string;
+		isOnline: boolean;
+	};
+
+	const WS_BASE = (import.meta.env.VITE_WS_BASE as string | undefined) ?? 'ws://localhost:8080';
+
+	let ws: WebSocket | null = null;
+	let wsRoomId = '';
+	let wsState: ConnectionState = 'idle';
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let reconnectAttempts = 0;
+
 	let toastMessage = '';
+	let showToast = false;
+	let toastTimer: ReturnType<typeof setTimeout> | null = null;
+	let lastToastRoom = '';
 
-	$: roomId = $page.params.roomId ?? '';
+	let chatListSearch = '';
+	let roomMessageSearch = '';
+	let draftMessage = '';
+	let attachedFile: File | null = null;
+	let showLeftMenu = false;
+	let showRoomMenu = false;
+	let showRoomSearch = false;
+	let showRoomInfo = false;
 
-	onMount(() => {
-		toastMessage = `Joined Room: ${roomId}`;
+	let roomThreads: ChatThread[] = [];
+	let messagesByRoom: Record<string, ChatMessage[]> = {};
+	let onlineByRoom: Record<string, OnlineMember[]> = {};
+	let pendingOutgoingByRoom: Record<string, ChatMessage[]> = {};
+
+	let fileInput: HTMLInputElement | null = null;
+	let messageViewport: HTMLDivElement | null = null;
+	let lastRenderedMessageCount = 0;
+
+	$: roomId = decodeURIComponent($page.params.roomId ?? '');
+	$: currentUserId = $currentUser?.id ?? 'guest';
+	$: currentUsername = $currentUser?.username ?? 'Guest';
+	$: activeThread =
+		roomThreads.find((thread) => thread.id === roomId) ?? createThread(roomId || 'default-room');
+	$: currentMessages = messagesByRoom[roomId] ?? [];
+	$: currentOnlineMembers = onlineByRoom[roomId] ?? [];
+	$: activeUnreadCount = activeThread?.unread ?? 0;
+	$: connectionLabel = getConnectionLabel(wsState);
+	$: filteredThreads = getFilteredThreads();
+	$: visibleMessages = getVisibleMessages();
+	$: if (roomId) {
+		ensureRoomThread(roomId);
+		ensureOnlineSeed(roomId);
+	}
+	$: if (browser && roomId && roomId !== wsRoomId) {
+		connectToRoom(roomId);
+	}
+	$: if (browser && roomId && roomId !== lastToastRoom) {
+		showJoinToast(roomId);
+	}
+	$: if (visibleMessages.length !== lastRenderedMessageCount) {
+		lastRenderedMessageCount = visibleMessages.length;
+		void tick().then(scrollMessagesToBottom);
+	}
+
+	onDestroy(() => {
+		closeSocket();
+		clearReconnectTimer();
+		clearToastTimer();
+	});
+
+	function clearReconnectTimer() {
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		}
+	}
+
+	function clearToastTimer() {
+		if (toastTimer) {
+			clearTimeout(toastTimer);
+			toastTimer = null;
+		}
+	}
+
+	function showJoinToast(activeRoomId: string) {
+		lastToastRoom = activeRoomId;
+		toastMessage = `Joined Room: ${activeRoomId}`;
 		showToast = true;
-
-		const toastTimer = setTimeout(() => {
+		clearToastTimer();
+		toastTimer = setTimeout(() => {
 			showToast = false;
 		}, 3000);
+	}
 
-		return () => clearTimeout(toastTimer);
-	});
+	function createThread(id: string, nameOverride?: string): ChatThread {
+		const defaultName = nameOverride ?? formatRoomName(id);
+		return {
+			id,
+			name: defaultName,
+			lastMessage: '',
+			lastActivity: Date.now(),
+			unread: 0
+		};
+	}
+
+	function ensureRoomThread(targetRoomId: string, nameOverride?: string) {
+		const existing = roomThreads.find((thread) => thread.id === targetRoomId);
+		if (existing) {
+			if (nameOverride && existing.name !== nameOverride) {
+				roomThreads = sortThreads(
+					roomThreads.map((thread) =>
+						thread.id === targetRoomId ? { ...thread, name: nameOverride } : thread
+					)
+				);
+			}
+			return;
+		}
+
+		const nextThread = createThread(targetRoomId, nameOverride);
+		roomThreads = sortThreads([nextThread, ...roomThreads]);
+	}
+
+	function updateThreadPreview(targetRoomId: string) {
+		const roomMessages = messagesByRoom[targetRoomId] ?? [];
+		const lastMessage = roomMessages[roomMessages.length - 1];
+		const fallbackName = formatRoomName(targetRoomId);
+
+		if (!lastMessage) {
+			ensureRoomThread(targetRoomId, fallbackName);
+			return;
+		}
+
+		const merged = roomThreads.some((thread) => thread.id === targetRoomId)
+			? roomThreads.map((thread) =>
+					thread.id === targetRoomId
+						? {
+								...thread,
+								name: thread.name || fallbackName,
+								lastMessage: lastMessage.content,
+								lastActivity: lastMessage.createdAt
+							}
+						: thread
+				)
+			: [
+					{
+						id: targetRoomId,
+						name: fallbackName,
+						lastMessage: lastMessage.content,
+						lastActivity: lastMessage.createdAt,
+						unread: 0
+					},
+					...roomThreads
+				];
+
+		roomThreads = sortThreads(merged);
+	}
+
+	function sortThreads(threads: ChatThread[]) {
+		return [...threads].sort((a, b) => b.lastActivity - a.lastActivity);
+	}
+
+	function ensureOnlineSeed(targetRoomId: string) {
+		if (onlineByRoom[targetRoomId]?.length) {
+			return;
+		}
+
+		const me = { id: currentUserId, name: currentUsername, isOnline: true };
+		const fallbackMembers: OnlineMember[] = [
+			me,
+			{ id: `${targetRoomId}-member-1`, name: 'Member One', isOnline: true },
+			{ id: `${targetRoomId}-member-2`, name: 'Member Two', isOnline: true }
+		];
+
+		onlineByRoom = {
+			...onlineByRoom,
+			[targetRoomId]: dedupeMembers(fallbackMembers)
+		};
+	}
+
+	function selectRoom(targetRoomId: string) {
+		if (!targetRoomId || targetRoomId === roomId) {
+			return;
+		}
+		showLeftMenu = false;
+		showRoomMenu = false;
+		showRoomSearch = false;
+		roomMessageSearch = '';
+		showRoomInfo = false;
+		void goto(`/chat/${encodeURIComponent(targetRoomId)}`);
+	}
+
+	function connectToRoom(targetRoomId: string) {
+		if (!browser || !targetRoomId) {
+			return;
+		}
+
+		clearReconnectTimer();
+		closeSocket();
+		wsState = 'connecting';
+		wsRoomId = targetRoomId;
+
+		try {
+			const nextSocket = new WebSocket(`${WS_BASE}/ws/${encodeURIComponent(targetRoomId)}`);
+			ws = nextSocket;
+
+			nextSocket.onopen = () => {
+				if (ws !== nextSocket) {
+					return;
+				}
+				wsState = 'open';
+				reconnectAttempts = 0;
+				markRoomAsRead(targetRoomId);
+				flushPendingOutgoing(targetRoomId);
+			};
+
+			nextSocket.onmessage = (event: MessageEvent) => {
+				if (ws !== nextSocket) {
+					return;
+				}
+				if (typeof event.data !== 'string') {
+					return;
+				}
+				handleSocketPayload(event.data, targetRoomId);
+			};
+
+			nextSocket.onerror = () => {
+				if (ws !== nextSocket) {
+					return;
+				}
+				wsState = 'error';
+			};
+
+			nextSocket.onclose = () => {
+				if (ws !== nextSocket) {
+					return;
+				}
+				wsState = 'closed';
+				if (roomId === targetRoomId) {
+					scheduleReconnect(targetRoomId);
+				}
+			};
+		} catch (error) {
+			console.error('Socket connection failed', error);
+			wsState = 'error';
+			scheduleReconnect(targetRoomId);
+		}
+	}
+
+	function scheduleReconnect(targetRoomId: string) {
+		clearReconnectTimer();
+		reconnectAttempts = Math.min(reconnectAttempts + 1, 5);
+		const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 9000);
+		reconnectTimer = setTimeout(() => {
+			if (roomId === targetRoomId) {
+				connectToRoom(targetRoomId);
+			}
+		}, delay);
+	}
+
+	function closeSocket() {
+		if (!ws) {
+			wsRoomId = '';
+			wsState = 'idle';
+			return;
+		}
+
+		const activeSocket = ws;
+		ws = null;
+		activeSocket.onopen = null;
+		activeSocket.onmessage = null;
+		activeSocket.onclose = null;
+		activeSocket.onerror = null;
+		if (
+			activeSocket.readyState === WebSocket.OPEN ||
+			activeSocket.readyState === WebSocket.CONNECTING
+		) {
+			activeSocket.close();
+		}
+		wsRoomId = '';
+		wsState = 'idle';
+	}
+
+	function handleSocketPayload(raw: string, targetRoomId: string) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch (error) {
+			console.error('Failed to parse socket payload', error);
+			return;
+		}
+
+		if (Array.isArray(parsed)) {
+			const history = parsed
+				.map((entry) => parseIncomingMessage(entry, targetRoomId))
+				.filter((entry): entry is ChatMessage => Boolean(entry));
+			mergeMessages(targetRoomId, history);
+			markRoomAsRead(targetRoomId);
+			return;
+		}
+
+		if (isEnvelope(parsed)) {
+			handleEnvelope(parsed, targetRoomId);
+			return;
+		}
+
+		const singleMessage = parseIncomingMessage(parsed, targetRoomId);
+		if (singleMessage) {
+			addIncomingMessage(singleMessage);
+		}
+	}
+
+	function isEnvelope(value: unknown): value is { type: string; payload: unknown } {
+		return Boolean(
+			value &&
+			typeof value === 'object' &&
+			'type' in value &&
+			typeof (value as { type?: unknown }).type === 'string'
+		);
+	}
+
+	function handleEnvelope(envelope: { type: string; payload: unknown }, targetRoomId: string) {
+		const kind = envelope.type;
+		if (kind === 'history' || kind === 'recent_messages' || kind === 'initial_messages') {
+			if (Array.isArray(envelope.payload)) {
+				const history = envelope.payload
+					.map((entry) => parseIncomingMessage(entry, targetRoomId))
+					.filter((entry): entry is ChatMessage => Boolean(entry));
+				mergeMessages(targetRoomId, history);
+				markRoomAsRead(targetRoomId);
+			}
+			return;
+		}
+
+		if (kind === 'new_message') {
+			const message = parseIncomingMessage(envelope.payload, targetRoomId);
+			if (message) {
+				addIncomingMessage(message);
+			}
+			return;
+		}
+
+		if (kind === 'online_list' && Array.isArray(envelope.payload)) {
+			const members = envelope.payload
+				.map((entry, index) => parseMember(entry, index))
+				.filter((entry): entry is OnlineMember => Boolean(entry));
+			onlineByRoom = {
+				...onlineByRoom,
+				[targetRoomId]: dedupeMembers(members)
+			};
+			return;
+		}
+
+		if (kind === 'user_joined') {
+			const joined = parseMember(envelope.payload, Date.now());
+			if (joined) {
+				upsertOnlineMember(targetRoomId, joined);
+			}
+			return;
+		}
+
+		if (kind === 'user_left') {
+			const leaving = parseMember(envelope.payload, Date.now());
+			if (leaving) {
+				removeOnlineMember(targetRoomId, leaving.id);
+			}
+		}
+	}
+
+	function parseIncomingMessage(value: unknown, fallbackRoomId: string): ChatMessage | null {
+		if (!value || typeof value !== 'object') {
+			return null;
+		}
+
+		const source = value as Record<string, unknown>;
+		const nextRoomId = toStringValue(source.roomId ?? source.room_id ?? fallbackRoomId);
+		if (!nextRoomId) {
+			return null;
+		}
+
+		const messageType = toStringValue(source.type ?? 'text') || 'text';
+		const messageContent = toStringValue(source.content ?? source.text ?? '');
+
+		const normalized: ChatMessage = {
+			id: toStringValue(source.id) || createMessageId(nextRoomId),
+			roomId: nextRoomId,
+			senderId: toStringValue(source.senderId ?? source.sender_id ?? 'unknown'),
+			senderName: toStringValue(source.senderName ?? source.sender_name ?? 'Unknown'),
+			content: messageContent,
+			type: messageType,
+			createdAt: toTimestamp(source.createdAt ?? source.created_at ?? source.timestamp),
+			pending: false
+		};
+
+		return normalized;
+	}
+
+	function parseMember(value: unknown, fallbackIndex: number): OnlineMember | null {
+		if (!value || typeof value !== 'object') {
+			return null;
+		}
+		const source = value as Record<string, unknown>;
+		const memberId = toStringValue(
+			source.id ?? source.userId ?? source.user_id ?? `member-${fallbackIndex}`
+		);
+		const memberName =
+			toStringValue(source.name ?? source.username ?? source.userName ?? source.user_name) ||
+			memberId;
+		if (!memberId) {
+			return null;
+		}
+		return { id: memberId, name: memberName, isOnline: true };
+	}
+
+	function addIncomingMessage(message: ChatMessage) {
+		const shouldCountUnread = message.roomId !== roomId;
+		upsertMessage(message.roomId, message, shouldCountUnread);
+		if (message.roomId === roomId) {
+			markRoomAsRead(roomId);
+		}
+	}
+
+	function upsertMessage(targetRoomId: string, message: ChatMessage, shouldCountUnread: boolean) {
+		const roomMessages = messagesByRoom[targetRoomId] ?? [];
+		const existingIndex = roomMessages.findIndex((entry) => entry.id === message.id);
+
+		let nextMessages: ChatMessage[];
+		if (existingIndex >= 0) {
+			nextMessages = [...roomMessages];
+			nextMessages[existingIndex] = {
+				...nextMessages[existingIndex],
+				...message,
+				pending: false
+			};
+		} else {
+			nextMessages = [...roomMessages, message];
+		}
+
+		nextMessages.sort((a, b) => a.createdAt - b.createdAt);
+		messagesByRoom = {
+			...messagesByRoom,
+			[targetRoomId]: nextMessages
+		};
+
+		updateThreadPreview(targetRoomId);
+
+		if (shouldCountUnread) {
+			roomThreads = sortThreads(
+				roomThreads.map((thread) =>
+					thread.id === targetRoomId ? { ...thread, unread: thread.unread + 1 } : thread
+				)
+			);
+		}
+	}
+
+	function mergeMessages(targetRoomId: string, incoming: ChatMessage[]) {
+		if (incoming.length === 0) {
+			return;
+		}
+
+		const existing = messagesByRoom[targetRoomId] ?? [];
+		const merged = new Map<string, ChatMessage>();
+		for (const message of existing) {
+			merged.set(message.id, message);
+		}
+		for (const message of incoming) {
+			const current = merged.get(message.id);
+			merged.set(message.id, { ...current, ...message, pending: false });
+		}
+
+		const nextMessages = [...merged.values()].sort((a, b) => a.createdAt - b.createdAt);
+		messagesByRoom = {
+			...messagesByRoom,
+			[targetRoomId]: nextMessages
+		};
+		updateThreadPreview(targetRoomId);
+	}
+
+	function markRoomAsRead(targetRoomId: string) {
+		if (!targetRoomId) {
+			return;
+		}
+		roomThreads = sortThreads(
+			roomThreads.map((thread) => (thread.id === targetRoomId ? { ...thread, unread: 0 } : thread))
+		);
+	}
+
+	function upsertOnlineMember(targetRoomId: string, member: OnlineMember) {
+		const members = onlineByRoom[targetRoomId] ?? [];
+		const existingIndex = members.findIndex((entry) => entry.id === member.id);
+		let next: OnlineMember[];
+		if (existingIndex >= 0) {
+			next = [...members];
+			next[existingIndex] = { ...next[existingIndex], ...member, isOnline: true };
+		} else {
+			next = [...members, { ...member, isOnline: true }];
+		}
+		onlineByRoom = {
+			...onlineByRoom,
+			[targetRoomId]: dedupeMembers(next)
+		};
+	}
+
+	function removeOnlineMember(targetRoomId: string, memberId: string) {
+		const members = onlineByRoom[targetRoomId] ?? [];
+		onlineByRoom = {
+			...onlineByRoom,
+			[targetRoomId]: members.filter((member) => member.id !== memberId)
+		};
+	}
+
+	function dedupeMembers(members: OnlineMember[]) {
+		const byId = new Map<string, OnlineMember>();
+		for (const member of members) {
+			byId.set(member.id, member);
+		}
+		return [...byId.values()];
+	}
+
+	function queueOutgoing(message: ChatMessage) {
+		const currentQueue = pendingOutgoingByRoom[message.roomId] ?? [];
+		pendingOutgoingByRoom = {
+			...pendingOutgoingByRoom,
+			[message.roomId]: [...currentQueue, message]
+		};
+	}
+
+	function flushPendingOutgoing(targetRoomId: string) {
+		const roomQueue = pendingOutgoingByRoom[targetRoomId] ?? [];
+		if (roomQueue.length === 0 || !ws || ws.readyState !== WebSocket.OPEN) {
+			return;
+		}
+
+		for (const queued of roomQueue) {
+			ws.send(JSON.stringify(toWireMessage(queued)));
+		}
+		pendingOutgoingByRoom = {
+			...pendingOutgoingByRoom,
+			[targetRoomId]: []
+		};
+	}
+
+	async function sendMessage() {
+		const text = draftMessage.trim();
+		if (!text && !attachedFile) {
+			return;
+		}
+
+		const nextMessage: ChatMessage = {
+			id: createMessageId(roomId),
+			roomId,
+			senderId: currentUserId,
+			senderName: currentUsername,
+			content: buildOutgoingContent(text, attachedFile),
+			type: attachedFile ? 'file' : 'text',
+			createdAt: Date.now(),
+			pending: true
+		};
+
+		upsertMessage(roomId, nextMessage, false);
+		markRoomAsRead(roomId);
+
+		draftMessage = '';
+		attachedFile = null;
+		if (fileInput) {
+			fileInput.value = '';
+		}
+
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			ws.send(JSON.stringify(toWireMessage(nextMessage)));
+		} else {
+			queueOutgoing(nextMessage);
+		}
+
+		await tick();
+		scrollMessagesToBottom();
+	}
+
+	function toWireMessage(message: ChatMessage) {
+		return {
+			id: message.id,
+			roomId: message.roomId,
+			senderId: message.senderId,
+			senderName: message.senderName,
+			content: message.content,
+			type: message.type,
+			createdAt: new Date(message.createdAt).toISOString()
+		};
+	}
+
+	function buildOutgoingContent(text: string, file: File | null) {
+		if (!file) {
+			return text;
+		}
+		if (!text) {
+			return `[File] ${file.name}`;
+		}
+		return `[File] ${file.name} - ${text}`;
+	}
+
+	function onComposerKeyDown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			void sendMessage();
+		}
+	}
+
+	function openFilePicker() {
+		fileInput?.click();
+	}
+
+	function onFilePicked(event: Event) {
+		const target = event.currentTarget as HTMLInputElement;
+		const picked = target.files?.[0] ?? null;
+		attachedFile = picked;
+	}
+
+	function removeAttachedFile() {
+		attachedFile = null;
+		if (fileInput) {
+			fileInput.value = '';
+		}
+	}
+
+	function toggleLeftMenu() {
+		showLeftMenu = !showLeftMenu;
+		showRoomMenu = false;
+	}
+
+	function createRoomFromMenu() {
+		const input = window.prompt('Enter a room name');
+		showLeftMenu = false;
+		if (!input) {
+			return;
+		}
+
+		const nextRoomId = toRoomSlug(input);
+		if (!nextRoomId) {
+			return;
+		}
+
+		ensureRoomThread(nextRoomId);
+		ensureOnlineSeed(nextRoomId);
+		void goto(`/chat/${encodeURIComponent(nextRoomId)}`);
+	}
+
+	function toggleRoomMenu() {
+		showRoomMenu = !showRoomMenu;
+		showLeftMenu = false;
+	}
+
+	function toggleRoomSearch() {
+		showRoomSearch = !showRoomSearch;
+		showRoomMenu = false;
+		if (!showRoomSearch) {
+			roomMessageSearch = '';
+		}
+	}
+
+	function handleHeaderRoomClick() {
+		showRoomInfo = true;
+		showRoomMenu = false;
+	}
+
+	function closeRoomInfo() {
+		showRoomInfo = false;
+	}
+
+	function clearCurrentRoomMessages() {
+		if (!roomId) {
+			return;
+		}
+		messagesByRoom = {
+			...messagesByRoom,
+			[roomId]: []
+		};
+		updateThreadPreview(roomId);
+		showRoomMenu = false;
+	}
+
+	function getFilteredThreads() {
+		const threadsWithActive = getThreadsWithActive();
+		const query = chatListSearch.trim().toLowerCase();
+		if (!query) {
+			return threadsWithActive;
+		}
+
+		const filtered = threadsWithActive.filter((thread) => {
+			if (thread.name.toLowerCase().includes(query)) {
+				return true;
+			}
+			if (thread.lastMessage.toLowerCase().includes(query)) {
+				return true;
+			}
+			const messages = messagesByRoom[thread.id] ?? [];
+			return messages.some(
+				(message) =>
+					message.content.toLowerCase().includes(query) ||
+					message.senderName.toLowerCase().includes(query)
+			);
+		});
+
+		if (roomId && !filtered.some((thread) => thread.id === roomId)) {
+			const activeFallback = threadsWithActive.find((thread) => thread.id === roomId);
+			if (activeFallback) {
+				return [activeFallback, ...filtered];
+			}
+		}
+
+		return filtered;
+	}
+
+	function getThreadsWithActive() {
+		if (!roomId) {
+			return roomThreads;
+		}
+		if (roomThreads.some((thread) => thread.id === roomId)) {
+			return roomThreads;
+		}
+		return sortThreads([createThread(roomId, activeThread.name), ...roomThreads]);
+	}
+
+	function getVisibleMessages() {
+		const query = roomMessageSearch.trim().toLowerCase();
+		if (!query) {
+			return currentMessages;
+		}
+
+		return currentMessages.filter(
+			(message) =>
+				message.content.toLowerCase().includes(query) ||
+				message.senderName.toLowerCase().includes(query)
+		);
+	}
+
+	function toRoomSlug(value: string) {
+		const normalized = value.toLowerCase().trim();
+		if (!normalized) {
+			return '';
+		}
+
+		return normalized
+			.replace(/[^a-z0-9\s_-]/g, '')
+			.replace(/[\s_]+/g, '-')
+			.replace(/-+/g, '-')
+			.replace(/^-|-$/g, '');
+	}
+
+	function scrollMessagesToBottom() {
+		if (!messageViewport) {
+			return;
+		}
+		messageViewport.scrollTop = messageViewport.scrollHeight;
+	}
+
+	function getConnectionLabel(state: ConnectionState) {
+		if (state === 'open') {
+			return 'Live';
+		}
+		if (state === 'connecting') {
+			return 'Connecting';
+		}
+		if (state === 'error') {
+			return 'Error';
+		}
+		if (state === 'closed') {
+			return 'Offline';
+		}
+		return 'Idle';
+	}
+
+	function createMessageId(targetRoomId: string) {
+		if (browser && typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+			return crypto.randomUUID();
+		}
+		return `${targetRoomId}-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+	}
+
+	function formatRoomName(targetRoomId: string) {
+		return targetRoomId
+			.split('-')
+			.filter(Boolean)
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+			.join(' ');
+	}
+
+	function formatClock(timestamp: number) {
+		const safe = toTimestamp(timestamp);
+		return new Date(safe).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	}
+
+	function formatLastSeen(timestamp: number) {
+		const safe = toTimestamp(timestamp);
+		return new Date(safe).toLocaleDateString([], {
+			month: 'short',
+			day: 'numeric'
+		});
+	}
+
+	function toTimestamp(value: unknown) {
+		if (typeof value === 'number' && Number.isFinite(value)) {
+			return value;
+		}
+		if (typeof value === 'string') {
+			const asNumber = Number(value);
+			if (Number.isFinite(asNumber)) {
+				return asNumber;
+			}
+			const parsed = Date.parse(value);
+			if (Number.isFinite(parsed)) {
+				return parsed;
+			}
+		}
+		if (value instanceof Date) {
+			return value.getTime();
+		}
+		return Date.now();
+	}
+
+	function toStringValue(value: unknown) {
+		if (typeof value === 'string') {
+			return value;
+		}
+		if (typeof value === 'number' || typeof value === 'boolean') {
+			return String(value);
+		}
+		return '';
+	}
 </script>
 
 {#if showToast}
@@ -25,54 +860,744 @@
 	</div>
 {/if}
 
-<main class="chat-page">
-	<section class="chat-card">
-		<h1>Room: {roomId}</h1>
-		<p>Connected and ready.</p>
+<section class="chat-shell">
+	<aside class="room-list">
+		<div class="room-list-header">
+			<div class="list-title">
+				<h2>Chats</h2>
+				<span class="thread-count">{roomThreads.length}</span>
+			</div>
+			<div class="list-actions">
+				<button type="button" class="icon-button" on:click={toggleLeftMenu} title="Room options">
+					...
+				</button>
+				{#if showLeftMenu}
+					<div class="room-menu left-menu">
+						<button type="button" on:click={createRoomFromMenu}>New room</button>
+					</div>
+				{/if}
+			</div>
+		</div>
+		<div class="room-list-search">
+			<input type="text" bind:value={chatListSearch} placeholder="Search names or messages" />
+		</div>
+		<div class="room-items">
+			{#if filteredThreads.length === 0 && !roomId}
+				<div class="empty-label">No chats matched your search.</div>
+			{:else}
+				{#each filteredThreads as thread (thread.id)}
+					<button
+						type="button"
+						class="room-item {thread.id === roomId ? 'selected' : ''}"
+						on:click={() => selectRoom(thread.id)}
+					>
+						<span class="avatar">{thread.name.charAt(0).toUpperCase()}</span>
+						<span class="item-main">
+							<span class="item-top">
+								<span class="room-name">{thread.name}</span>
+								<span class="room-time">{formatClock(thread.lastActivity)}</span>
+							</span>
+							<span class="item-bottom">
+								<span class="room-preview">{thread.lastMessage || 'No messages yet'}</span>
+								{#if thread.unread > 0}
+									<span class="unread">{thread.unread}</span>
+								{/if}
+							</span>
+						</span>
+					</button>
+				{/each}
+			{/if}
+		</div>
+	</aside>
+
+	<section class="chat-window">
+		<header class="chat-header">
+			<button type="button" class="room-title-button" on:click={handleHeaderRoomClick}>
+				<span class="presence-dot"></span>
+				<span class="title-text">
+					<span class="title-main">{activeThread.name}</span>
+					<span class="title-sub">
+						{currentOnlineMembers.length} online
+						{#if activeUnreadCount > 0}
+							- {activeUnreadCount} unread
+						{/if}
+					</span>
+				</span>
+			</button>
+
+			<div class="header-actions">
+				<span class="connection {wsState}">{connectionLabel}</span>
+				<button type="button" class="icon-button" on:click={toggleRoomMenu} title="More options">
+					...
+				</button>
+				{#if showRoomMenu}
+					<div class="room-menu">
+						<button type="button" on:click={toggleRoomSearch}>
+							{showRoomSearch ? 'Hide search' : 'Search messages'}
+						</button>
+						<button type="button" on:click={() => markRoomAsRead(roomId)}>Mark read</button>
+						<button type="button" on:click={clearCurrentRoomMessages}>Clear local</button>
+					</div>
+				{/if}
+			</div>
+		</header>
+
+		{#if showRoomSearch}
+			<div class="chat-search-row">
+				<input type="text" bind:value={roomMessageSearch} placeholder="Search in this room" />
+			</div>
+		{/if}
+
+		<div class="messages" bind:this={messageViewport}>
+			{#if visibleMessages.length === 0}
+				<div class="empty-thread">
+					{#if roomMessageSearch.trim()}
+						No messages matched your room search.
+					{:else}
+						No messages yet. Send the first one.
+					{/if}
+				</div>
+			{/if}
+
+			{#each visibleMessages as message (message.id)}
+				<article
+					class="bubble {message.senderId === currentUserId ? 'mine' : 'theirs'} {message.pending
+						? 'pending'
+						: ''}"
+				>
+					<div class="bubble-meta">
+						<span>{message.senderName}</span>
+						<time>{formatClock(message.createdAt)}</time>
+					</div>
+					<div class="bubble-content">{message.content}</div>
+				</article>
+			{/each}
+		</div>
+
+		<footer class="composer">
+			{#if attachedFile}
+				<div class="attachment-pill">
+					<span>{attachedFile.name}</span>
+					<button type="button" on:click={removeAttachedFile}>x</button>
+				</div>
+			{/if}
+			<div class="composer-row">
+				<input
+					bind:this={fileInput}
+					type="file"
+					class="hidden-file-input"
+					on:change={onFilePicked}
+				/>
+				<button type="button" class="attach-button" on:click={openFilePicker}>Attach</button>
+				<textarea
+					bind:value={draftMessage}
+					rows="1"
+					placeholder="Type a message"
+					on:keydown={onComposerKeyDown}
+				></textarea>
+				<button type="button" class="send-button" on:click={sendMessage}>Send</button>
+			</div>
+		</footer>
 	</section>
-</main>
+
+	<aside class="online-panel">
+		<div class="online-header">
+			<h3>Online</h3>
+			<span>{currentOnlineMembers.length}</span>
+		</div>
+		<div class="online-list">
+			{#if currentOnlineMembers.length === 0}
+				<div class="empty-label">No online members.</div>
+			{:else}
+				{#each currentOnlineMembers as member (member.id)}
+					<div class="online-member">
+						<span class="member-dot"></span>
+						<span class="member-name">{member.name}</span>
+					</div>
+				{/each}
+			{/if}
+		</div>
+	</aside>
+</section>
+
+{#if showRoomInfo}
+	<button
+		type="button"
+		class="mobile-info-backdrop"
+		aria-label="Close room info"
+		on:click={closeRoomInfo}
+	></button>
+	<aside class="mobile-info-panel">
+		<header>
+			<h3>{activeThread.name}</h3>
+			<button type="button" on:click={closeRoomInfo}>Close</button>
+		</header>
+		<div class="mobile-info-content">
+			{#if currentOnlineMembers.length === 0}
+				<div class="empty-label">No online members.</div>
+			{:else}
+				{#each currentOnlineMembers as member (member.id)}
+					<div class="online-member">
+						<span class="member-dot"></span>
+						<div>
+							<div class="member-name">{member.name}</div>
+							<div class="member-meta">Seen {formatLastSeen(Date.now())}</div>
+						</div>
+					</div>
+				{/each}
+			{/if}
+		</div>
+	</aside>
+{/if}
 
 <style>
-	.chat-page {
-		min-height: 100vh;
+	.chat-shell {
+		height: calc(100vh - 72px);
+		min-height: 620px;
 		display: grid;
-		place-items: center;
-		padding: 2rem 1rem;
-		background: linear-gradient(160deg, #f8fafc 0%, #eef2ff 100%);
+		grid-template-columns: 320px minmax(0, 1fr) 270px;
+		border-top: 1px solid #d9dee4;
+		background: #f3f5f7;
 	}
 
-	.chat-card {
-		width: min(640px, 100%);
+	.room-list {
+		display: flex;
+		flex-direction: column;
+		border-right: 1px solid #d9dee4;
 		background: #ffffff;
-		border-radius: 14px;
-		padding: 2rem;
-		box-shadow: 0 14px 40px rgba(15, 23, 42, 0.08);
 	}
 
-	h1 {
-		margin: 0 0 0.5rem;
-		color: #0f172a;
-		font-size: clamp(1.4rem, 2vw, 1.9rem);
+	.room-list-header {
+		padding: 1rem 1rem 0.75rem;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		position: relative;
 	}
 
-	p {
+	.list-title {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.list-actions {
+		position: relative;
+	}
+
+	.room-list-header h2 {
 		margin: 0;
-		color: #475569;
+		font-size: 1.05rem;
+	}
+
+	.thread-count {
+		font-size: 0.85rem;
+		font-weight: 700;
+		color: #166534;
+		background: #dcfce7;
+		padding: 0.2rem 0.5rem;
+		border-radius: 999px;
+	}
+
+	.room-list-search {
+		padding: 0 1rem 0.75rem;
+	}
+
+	.room-list-search input {
+		width: 100%;
+		border: 1px solid #cfd8e3;
+		border-radius: 8px;
+		padding: 0.55rem 0.7rem;
+		font-size: 0.92rem;
+	}
+
+	.room-items {
+		flex: 1;
+		overflow: auto;
+	}
+
+	.room-item {
+		width: 100%;
+		display: flex;
+		gap: 0.75rem;
+		padding: 0.78rem 0.9rem;
+		border: none;
+		border-top: 1px solid #f1f3f6;
+		text-align: left;
+		background: transparent;
+		cursor: pointer;
+	}
+
+	.room-item:hover {
+		background: #f8fafc;
+	}
+
+	.room-item.selected {
+		background: #e8f5ec;
+	}
+
+	.avatar {
+		width: 38px;
+		height: 38px;
+		border-radius: 50%;
+		background: #dde7f4;
+		color: #1e293b;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-weight: 700;
+	}
+
+	.item-main {
+		min-width: 0;
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+
+	.item-top,
+	.item-bottom {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 0.6rem;
+	}
+
+	.room-name {
+		font-size: 0.92rem;
+		font-weight: 600;
+		color: #162136;
+	}
+
+	.room-time {
+		font-size: 0.78rem;
+		color: #607188;
+		white-space: nowrap;
+	}
+
+	.room-preview {
+		font-size: 0.82rem;
+		color: #546479;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.unread {
+		min-width: 20px;
+		height: 20px;
+		border-radius: 999px;
+		background: #16a34a;
+		color: #ffffff;
+		font-size: 0.75rem;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-weight: 700;
+	}
+
+	.chat-window {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+		background: #efeae2;
+	}
+
+	.chat-header {
+		position: relative;
+		background: #f6f8fa;
+		border-bottom: 1px solid #d9dee4;
+		padding: 0.8rem 1rem;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+	}
+
+	.room-title-button {
+		border: none;
+		background: transparent;
+		padding: 0;
+		display: flex;
+		align-items: center;
+		gap: 0.55rem;
+		cursor: pointer;
+		color: #0f172a;
+	}
+
+	.presence-dot {
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: #22c55e;
+	}
+
+	.title-text {
+		display: inline-flex;
+		flex-direction: column;
+		align-items: flex-start;
+	}
+
+	.title-main {
+		font-size: 0.98rem;
+		font-weight: 700;
+	}
+
+	.title-sub {
+		font-size: 0.76rem;
+		color: #64748b;
+	}
+
+	.header-actions {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		position: relative;
+	}
+
+	.connection {
+		font-size: 0.74rem;
+		font-weight: 700;
+		padding: 0.2rem 0.5rem;
+		border-radius: 999px;
+		background: #dbe5f1;
+		color: #1e293b;
+	}
+
+	.connection.open {
+		background: #dcfce7;
+		color: #166534;
+	}
+
+	.connection.connecting {
+		background: #fef9c3;
+		color: #854d0e;
+	}
+
+	.connection.error,
+	.connection.closed {
+		background: #fee2e2;
+		color: #b91c1c;
+	}
+
+	.icon-button {
+		border: 1px solid #cdd7e1;
+		background: #ffffff;
+		border-radius: 6px;
+		padding: 0.35rem 0.55rem;
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+
+	.room-menu {
+		position: absolute;
+		top: calc(100% + 6px);
+		right: 0;
+		background: #ffffff;
+		border: 1px solid #d8e0e9;
+		border-radius: 8px;
+		box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+		overflow: hidden;
+		min-width: 138px;
+		z-index: 100;
+	}
+
+	.left-menu {
+		left: 0;
+		right: auto;
+	}
+
+	.room-menu button {
+		width: 100%;
+		border: none;
+		background: #ffffff;
+		padding: 0.55rem 0.75rem;
+		text-align: left;
+		font-size: 0.84rem;
+		cursor: pointer;
+	}
+
+	.room-menu button:hover {
+		background: #f3f6fa;
+	}
+
+	.chat-search-row {
+		padding: 0.65rem 0.9rem;
+		background: #f6f8fa;
+		border-bottom: 1px solid #d9dee4;
+	}
+
+	.chat-search-row input {
+		width: 100%;
+		border: 1px solid #cfd8e3;
+		border-radius: 8px;
+		padding: 0.55rem 0.7rem;
+		font-size: 0.9rem;
+	}
+
+	.messages {
+		flex: 1;
+		overflow: auto;
+		padding: 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.72rem;
+	}
+
+	.bubble {
+		max-width: min(75%, 540px);
+		border-radius: 12px;
+		padding: 0.58rem 0.7rem;
+		background: #ffffff;
+		box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+	}
+
+	.bubble.mine {
+		align-self: flex-end;
+		background: #dcf8c6;
+	}
+
+	.bubble.pending {
+		opacity: 0.65;
+	}
+
+	.bubble-meta {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.75rem;
+		font-size: 0.72rem;
+		color: #5b6472;
+		margin-bottom: 0.28rem;
+	}
+
+	.bubble-content {
+		font-size: 0.89rem;
+		line-height: 1.35;
+		color: #142032;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+
+	.composer {
+		border-top: 1px solid #d9dee4;
+		background: #f6f8fa;
+		padding: 0.75rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.attachment-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.35rem 0.6rem;
+		background: #dbeafe;
+		color: #1e3a8a;
+		border-radius: 999px;
+		width: fit-content;
+		font-size: 0.82rem;
+	}
+
+	.attachment-pill button {
+		border: none;
+		background: transparent;
+		color: inherit;
+		cursor: pointer;
+		font-weight: 700;
+	}
+
+	.composer-row {
+		display: grid;
+		grid-template-columns: auto 1fr auto;
+		gap: 0.55rem;
+		align-items: end;
+	}
+
+	.hidden-file-input {
+		display: none;
+	}
+
+	.attach-button,
+	.send-button {
+		border: 1px solid #cfd8e3;
+		background: #ffffff;
+		border-radius: 8px;
+		padding: 0.52rem 0.72rem;
+		font-size: 0.85rem;
+		cursor: pointer;
+	}
+
+	.send-button {
+		background: #1f9d4c;
+		border-color: #1f9d4c;
+		color: #ffffff;
+	}
+
+	textarea {
+		width: 100%;
+		resize: none;
+		min-height: 40px;
+		max-height: 110px;
+		border: 1px solid #cfd8e3;
+		border-radius: 9px;
+		padding: 0.55rem 0.66rem;
+		font-size: 0.91rem;
+		font-family: inherit;
+	}
+
+	.online-panel {
+		border-left: 1px solid #d9dee4;
+		background: #ffffff;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.online-header {
+		padding: 1rem;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		border-bottom: 1px solid #edf1f5;
+	}
+
+	.online-header h3 {
+		margin: 0;
+		font-size: 0.95rem;
+	}
+
+	.online-header span {
+		font-size: 0.82rem;
+		color: #334155;
+		font-weight: 700;
+	}
+
+	.online-list {
+		flex: 1;
+		overflow: auto;
+		padding: 0.75rem;
+	}
+
+	.online-member {
+		display: flex;
+		align-items: center;
+		gap: 0.52rem;
+		padding: 0.45rem 0.2rem;
+	}
+
+	.member-dot {
+		width: 9px;
+		height: 9px;
+		border-radius: 50%;
+		background: #22c55e;
+	}
+
+	.member-name {
+		font-size: 0.88rem;
+		color: #172132;
+	}
+
+	.member-meta {
+		font-size: 0.75rem;
+		color: #64748b;
+	}
+
+	.empty-label,
+	.empty-thread {
+		color: #64748b;
+		font-size: 0.84rem;
+		padding: 1rem;
+	}
+
+	.mobile-info-backdrop {
+		position: fixed;
+		inset: 0;
+		background: rgba(15, 23, 42, 0.35);
+		border: none;
+		z-index: 150;
+	}
+
+	.mobile-info-panel {
+		position: fixed;
+		right: 0;
+		top: 0;
+		height: 100vh;
+		width: min(92vw, 320px);
+		background: #ffffff;
+		z-index: 160;
+		box-shadow: -14px 0 30px rgba(15, 23, 42, 0.2);
+		display: flex;
+		flex-direction: column;
+	}
+
+	.mobile-info-panel header {
+		padding: 0.9rem 1rem;
+		border-bottom: 1px solid #e8edf3;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.mobile-info-panel header h3 {
+		margin: 0;
+		font-size: 1rem;
+	}
+
+	.mobile-info-panel header button {
+		border: 1px solid #d4dce6;
+		background: #ffffff;
+		border-radius: 7px;
+		padding: 0.32rem 0.5rem;
+		cursor: pointer;
+	}
+
+	.mobile-info-content {
+		padding: 0.7rem 0.85rem;
+		overflow: auto;
 	}
 
 	.toast {
 		position: fixed;
-		top: 1rem;
+		top: 0.8rem;
 		left: 50%;
 		transform: translateX(-50%);
 		background: #1f2937;
 		color: #ffffff;
-		padding: 0.7rem 1.1rem;
+		padding: 0.65rem 1rem;
 		border-radius: 999px;
+		font-size: 0.87rem;
 		font-weight: 600;
-		letter-spacing: 0.01em;
-		box-shadow: 0 10px 24px rgba(0, 0, 0, 0.25);
-		z-index: 9999;
+		box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22);
+		z-index: 500;
 		pointer-events: none;
+	}
+
+	@media (max-width: 1199px) {
+		.chat-shell {
+			grid-template-columns: 290px minmax(0, 1fr);
+		}
+
+		.online-panel {
+			display: none;
+		}
+	}
+
+	@media (max-width: 900px) {
+		.chat-shell {
+			grid-template-columns: 1fr;
+			grid-template-rows: minmax(220px, 36%) minmax(0, 64%);
+			height: calc(100vh - 72px);
+		}
+
+		.room-list {
+			display: flex;
+			border-right: none;
+			border-bottom: 1px solid #d9dee4;
+		}
+
+		.chat-window {
+			min-height: 0;
+		}
 	}
 </style>
